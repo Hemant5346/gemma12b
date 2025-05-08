@@ -1,11 +1,13 @@
 import os
 import sys
+import json
 import argparse
 from tqdm import tqdm
 from collections import defaultdict
 from tabulate import tabulate
 import numpy as np
 from vllm import LLM, SamplingParams
+from huggingface_hub import snapshot_download
 
 # Add root to sys.path (for src imports)
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../")))
@@ -14,7 +16,6 @@ from src.eval_utils.data import load_datasets, save_jsonl
 from src.eval_utils.grader import math_equal
 from src.eval_utils.parser import parse_ground_truth, extract_and_strip
 from src.eval_utils.vote import AGG_FN_MAP
-
 
 def compute_metrics_fn(eval_results, k, agg_method):
     final_results = []
@@ -53,18 +54,20 @@ def compute_metrics_fn(eval_results, k, agg_method):
     metrics.append({"Average": average_accuracy})
     return metrics
 
-
 # === CLI Arguments ===
 parser = argparse.ArgumentParser()
-parser.add_argument('--model_name_or_path', type=str, default="google/gemma-1.5-12b-it")
+parser.add_argument('--model_name_or_path', type=str, default="google/gemma-3-12b-it")
 parser.add_argument('--prompt_type', type=str, default="gemma-math-cot")
-parser.add_argument('--data_name', type=str, default="math")
+parser.add_argument('--data_name', type=str, default="college_math")
 parser.add_argument('--split', type=str, default="test")
 parser.add_argument('--output_dir', type=str, default="./outputs/gemma_12b")
 parser.add_argument('--num_test_sample', type=int, default=0)
 parser.add_argument('--temperature', type=float, default=0.7)
 parser.add_argument('--top_p', type=float, default=0.8)
 parser.add_argument('--save_outputs', action="store_true")
+parser.add_argument('--max_model_len', type=int, default=1024)
+parser.add_argument('--max_tokens', type=int, default=128)
+
 args = parser.parse_args()
 
 output_dir = os.path.abspath(args.output_dir)
@@ -79,17 +82,38 @@ if args.num_test_sample:
 print(f"[DEBUG] First sample:\n{datasets[0]}")
 print(f"[DEBUG] Available keys: {list(datasets[0].keys())}")
 
-# === Load VLLM Model ===
+# === Download model and patch rope_scaling ===
+print(f"[INFO] Downloading and preparing model: {args.model_name_or_path}")
+model_dir = snapshot_download(repo_id=args.model_name_or_path)
+config_path = os.path.join(model_dir, "config.json")
+
+with open(config_path, "r") as f:
+    config = json.load(f)
+
+if "rope_scaling" not in config:
+    config["rope_scaling"] = {"factor": 1.0, "type": "linear"}
+    print("[PATCH] Added missing rope_scaling with type='linear'")
+else:
+    if "type" not in config["rope_scaling"]:
+        config["rope_scaling"]["type"] = "linear"
+        print("[PATCH] Added 'type': 'linear' to existing rope_scaling")
+
+with open(config_path, "w") as f:
+    json.dump(config, f)
+
+# === Load VLLM Model from local directory ===
 sampling_params = SamplingParams(
     temperature=args.temperature,
     top_p=args.top_p,
-    max_tokens=512,
-    stop=[],
-    use_beam_search=False
+    max_tokens=args.max_tokens,
+    stop=[]
 )
 
-print(f"[INFO] Loading model: {args.model_name_or_path}")
-llm = LLM(model=args.model_name_or_path, dtype="float16")
+llm = LLM(
+    model=model_dir,
+    dtype="float16",
+    max_model_len=args.max_model_len
+)
 
 # === Generate responses ===
 generations = []
@@ -161,7 +185,7 @@ for agg_method in agg_fn_list:
 
 with open(metrics_output_path, "w") as f:
     for agg_method, result in all_results.items():
-        f.write(f"{agg_method}:\n\n")
+        f.write(f"{agg_method}::\n\n")
         f.write(tabulate(result, headers="keys", tablefmt="grid", floatfmt=".4f") + "\n\n\n")
 
 print(f"[INFO] Metrics saved.")
